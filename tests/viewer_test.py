@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf8 -*-
+# -*- coding: utf-8 -*-
 
 from nose.tools import ok_, eq_
 from nose.plugins.attrib import attr
@@ -17,6 +17,9 @@ class ViewerTestCase(unittest.TestCase):
         viewer.SPLASH_DELAY = 0
 
         self.u = viewer
+
+        self.m_scheduler = mock.Mock(name='m_scheduler')
+        self.p_scheduler = mock.patch.object(self.u, 'Scheduler', self.m_scheduler)
 
         self.m_cmd = mock.Mock(name='m_cmd')
         self.p_cmd = mock.patch.object(self.u.sh, 'Command', self.m_cmd)
@@ -103,13 +106,6 @@ class TestSignalHandlers(ViewerTestCase):
         eq_(None, self.u.sigusr1(None, None))
         self.m_killall.assert_called_once_with('omxplayer.bin', _ok_code=[1])
         self.p_killall.stop()
-
-    def test_usr2(self):
-        self.u.last_settings_refresh = -1
-        self.p_reload.start()
-        eq_(None, self.u.sigusr2(None, None))
-        self.m_reload.assert_called_once()
-        self.p_reload.stop()
 
 
 class TestWatchdog(ViewerTestCase):

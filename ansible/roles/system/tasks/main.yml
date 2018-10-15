@@ -19,12 +19,21 @@
     msg: "Detected BerryBoot installation. Skipping some steps."
   when: is_berryboot
 
+- name: Check NOOBS
+  command: cat /boot/config.txt
+  register: config_txt
+  tags:
+    - touches_boot_partition
+
+
 - name: Make sure we have proper framebuffer depth
   lineinfile:
     dest: /boot/config.txt
     regexp: ^framebuffer_depth=
     line: framebuffer_depth=32
   when: not is_berryboot
+  tags:
+    - touches_boot_partition
 
 - name: Fix framebuffer bug
   lineinfile:
@@ -32,6 +41,8 @@
     regexp: ^framebuffer_ignore_alpha=
     line: framebuffer_ignore_alpha=1
   when: not is_berryboot
+  tags:
+    - touches_boot_partition
 
 - name: Backup kernel boot args
   copy:
@@ -39,6 +50,8 @@
     dest: /boot/cmdline.txt.orig
     force: no
   when: not is_berryboot
+  tags:
+    - touches_boot_partition
 
 - debug:
     msg: "Use cmdline.txt.orig for boot parameters (don't remove this file)"
@@ -48,7 +61,25 @@
     src: /boot/cmdline.txt.orig
     dest: /boot/cmdline.txt
     force: yes
-  when: not is_berryboot
+  when: not is_berryboot and config_txt.stdout.find('NOOBS') == -1
+  tags:
+    - touches_boot_partition
+
+- name: For splash screen using Plymouth
+  replace:
+    dest: /boot/cmdline.txt
+    regexp: (^(?!$)((?!splash).)*$)
+    replace: \1 splash
+  when: not is_berryboot and ansible_distribution_major_version|int >= 7
+
+- name: Remove blinking cursor
+  replace:
+    dest: /boot/cmdline.txt
+    regexp: (^(?!$)((?!vt.global_cursor_default=0).)*$)
+    replace: \1 vt.global_cursor_default=0
+  when: not is_berryboot and ansible_distribution_major_version|int >= 7
+  tags:
+    - touches_boot_partition
 
 - name: Use Systemd as init and quiet boot process
   replace:
@@ -56,6 +87,8 @@
     regexp: (^(?!$)((?!quiet init=/lib/systemd/systemd).)*$)
     replace: \1 quiet init=/lib/systemd/systemd
   when: not is_berryboot
+  tags:
+    - touches_boot_partition
 
 - name: ethN/wlanN names for interfaces
   replace:
@@ -63,6 +96,51 @@
     regexp: (^(?!$)((?!net\.ifnames=0).)*$)
     replace: \1 net.ifnames=0
   when: not is_berryboot
+  tags:
+    - touches_boot_partition
+
+# Sometimes in some packages there are no necessary files.
+# They are required to install pip dependencies.
+# In this case we need to reinstall the packages.
+- name: Check if cdefs.h exists
+  stat:
+    path: /usr/include/arm-linux-gnueabihf/sys/cdefs.h
+  register: cdefs
+
+- set_fact: cdefs_exist="{{cdefs.stat.exists}}"
+
+- name: Remove libc6-dev
+  apt:
+    name: libc6-dev
+    state: absent
+  when: not cdefs_exist
+
+- name: Install libc6-dev
+  apt:
+    name: libc6-dev
+    state: present
+    update_cache: yes
+  when: not cdefs_exist
+
+- name: Check if cc1plus exists
+  stat:
+    path: /usr/lib/gcc/arm-linux-gnueabihf/4.9/cc1plus
+  register: cc1plus
+
+- set_fact: cc1plus_exist="{{cc1plus.stat.exists}}"
+
+- name: Remove build-essential
+  apt:
+    name: build-essential
+    state: absent
+  when: not cc1plus_exist
+
+- name: Install build-essential
+  apt:
+    name: build-essential
+    state: present
+    update_cache: yes
+  when: not cc1plus_exist
 
 - name: Install Screenly dependencies
   apt:
@@ -105,7 +183,8 @@
     - system-upgrade
 
 - name: Clean up unused packages
-  command: apt-get -y autoremove
+  apt:
+    autoremove: yes
   tags:
     - system-upgrade
 
@@ -138,6 +217,14 @@
     owner: root
     group: root
 
+- name: Disable DPMS
+  copy:
+    src: 10-serverflags.conf
+    dest: /usr/share/X11/xorg.conf.d/10-serverflags.conf
+    mode: 0644
+    owner: root
+    group: root
+
 - name: Clear out X11 configs (disables touchpad and other unnecessary things)
   file:
     path: "/usr/share/X11/xorg.conf.d/{{ item }}"
@@ -146,11 +233,6 @@
     - 50-synaptics.conf
     - 10-quirks.conf
     - 50-wacom.conf
-
-- name: Restart X
-  command: /bin/true
-  notify:
-    - restart-x-server
 
 - name: Disable swap
   command: /sbin/swapoff --all removes=/var/swap

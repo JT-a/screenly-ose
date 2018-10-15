@@ -1,21 +1,23 @@
-import requests
-import json
-import re
 import certifi
-from netifaces import ifaddresses
-from sh import grep, netstat
-from subprocess import check_output, call
-from urlparse import urlparse
-from datetime import timedelta
-from settings import settings, ZmqPublisher
-from assets_helper import update
-from datetime import datetime
-from os import getenv, path
 import db
+import json
+import os
 import pytz
-from platform import machine
+import re
+import requests
 
+from datetime import datetime, timedelta
+from distutils.util import strtobool
+from netifaces import ifaddresses, gateways
+from os import getenv, path, utime
+from platform import machine
+from settings import settings, ZmqPublisher
+from sh import grep, netstat, ErrorReturnCode_1
+from subprocess import check_output, call
 from threading import Thread
+from urlparse import urlparse
+
+from assets_helper import update
 
 arch = machine()
 
@@ -26,15 +28,31 @@ HTTP_OK = xrange(200, 299)
 # Travis can run.
 try:
     from sh import omxplayer
-except:
+except ImportError:
     pass
 
 # This will work on x86-based machines
 if machine() in ['x86', 'x86_64']:
     try:
-        from sh import mplayer
-    except:
+        from sh import ffprobe, mplayer
+    except ImportError:
         pass
+
+
+def string_to_bool(string):
+    return bool(strtobool(str(string)))
+
+
+def touch(path):
+    with open(path, 'a'):
+        utime(path, None)
+
+
+def is_ci():
+    """
+    Returns True when run on Travis.
+    """
+    return string_to_bool(os.getenv('CI', False))
 
 
 def validate_url(string):
@@ -56,48 +74,15 @@ def validate_url(string):
 
 
 def get_node_ip():
-    if arch in ('armv6l', 'armv7l'):
-
-        interface = None
-        for n in range(10):
-            iface = 'eth{}'.format(n)
-            try:
-                file_carrier = open('/sys/class/net/' + iface + '/carrier')
-                file_operstate = open('/sys/class/net/' + iface + '/operstate')
-
-                if "1" in file_carrier.read() and "up" in file_operstate.read():
-                    interface = iface
-                    break
-            except IOError:
-                continue
-
-        if not interface:
-            file_interfaces = open('/etc/network/interfaces')
-            for n in range(10):
-                iface = 'wlan{}'.format(n)
-                if iface in file_interfaces.read():
-                    interface = iface
-                    break
-
-        if not interface:
-            raise Exception("No active network connection found.")
-
-        try:
-            my_ip = ifaddresses(interface)[2][0]['addr']
-            return my_ip
-        except KeyError:
-            raise Exception("Unable to retrieve an IP.")
-
-    else:
         """Returns the node's IP, for the interface
         that is being used as the default gateway.
-        This shuld work on both MacOS X and Linux."""
-
+        This should work on both MacOS X and Linux."""
         try:
-            default_interface = grep(netstat('-nr'), '-e', '^default', '-e' '^0.0.0.0').split()[-1]
-            my_ip = ifaddresses(default_interface)[2][0]['addr']
+            address_family_id = max(list(gateways()['default']))
+            default_interface = gateways()['default'][address_family_id][1]
+            my_ip = ifaddresses(default_interface)[address_family_id][0]['addr']
             return my_ip
-        except:
+        except ValueError:
             raise Exception("Unable to resolve local IP address.")
 
 
@@ -106,28 +91,26 @@ def get_video_duration(file):
     Returns the duration of a video file in timedelta.
     """
     time = None
+
     try:
         if arch in ('armv6l', 'armv7l'):
-            run_omxplayer = omxplayer(file, info=True, _err_to_out=True)
-            for line in run_omxplayer.split('\n'):
-                if 'Duration' in line:
-                    match = re.search(r'[0-9]+:[0-9]+:[0-9]+\.[0-9]+', line)
-                    if match:
-                        time_input = match.group()
-                        time_split = time_input.split(':')
-                        hours = int(time_split[0])
-                        minutes = int(time_split[1])
-                        seconds = float(time_split[2])
-                        time = timedelta(hours=hours, minutes=minutes, seconds=seconds)
-                    break
+            run_player = omxplayer(file, info=True, _err_to_out=True, _ok_code=[0, 1], _decode_errors='ignore')
         else:
-            run_mplayer = mplayer('-identify', '-frames', '0', '-nosound', file)
-            for line in run_mplayer.split('\n'):
-                if 'ID_LENGTH=' in line:
-                    time = timedelta(seconds=int(round(float(line.split('=')[1]))))
-                    break
-    except:
-        pass
+            run_player = ffprobe('-i', file, _err_to_out=True)
+    except ErrorReturnCode_1:
+        raise Exception('Bad video format')
+
+    for line in run_player.split('\n'):
+        if 'Duration' in line:
+            match = re.search(r'[0-9]+:[0-9]+:[0-9]+\.[0-9]+', line)
+            if match:
+                time_input = match.group()
+                time_split = time_input.split(':')
+                hours = int(time_split[0])
+                minutes = int(time_split[1])
+                seconds = float(time_split[2])
+                time = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+            break
 
     return time
 
@@ -174,7 +157,7 @@ def url_fails(url):
         verify = False
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/538.15 (KHTML, like Gecko) Version/8.0 Safari/538.15',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/538.15 (KHTML, like Gecko) Version/8.0 Safari/538.15'
     }
     try:
         if not validate_url(url):
@@ -207,13 +190,15 @@ def url_fails(url):
 def download_video_from_youtube(uri, asset_id):
     home = getenv('HOME')
     name = check_output(['youtube-dl', '-e', uri])
+    info = json.loads(check_output(['youtube-dl', '-j', uri]))
+    duration = info['duration']
 
     location = path.join(home, 'screenly_assets', asset_id)
     thread = YoutubeDownloadThread(location, uri, asset_id)
     thread.daemon = True
     thread.start()
 
-    return location, unicode(name.decode('utf-8'))
+    return location, unicode(name.decode('utf-8')), duration
 
 
 class YoutubeDownloadThread(Thread):
@@ -226,14 +211,21 @@ class YoutubeDownloadThread(Thread):
     def run(self):
         publisher = ZmqPublisher.get_instance()
         call(['youtube-dl', '-f', 'mp4', '-o', self.location, self.uri])
-        publisher.send("video are downloaded")
         with db.conn(settings['database']) as conn:
             update(conn, self.asset_id, {'asset_id': self.asset_id, 'is_processing': 0})
 
-        publisher.send(self.asset_id)
+        publisher.send_to_ws_server(self.asset_id)
 
 
 def template_handle_unicode(value):
     if isinstance(value, str):
         return value.decode('utf-8')
     return unicode(value)
+
+
+def is_demo_node():
+    """
+    Check if the environment variable IS_DEMO_NODE is set to 1
+    :return: bool
+    """
+    return string_to_bool(os.getenv('IS_DEMO_NODE', False))

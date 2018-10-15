@@ -29,11 +29,32 @@ if [ "$INSTALL" != 'y' ]; then
   exit 1
 fi
 
-echo && read -p "Would you like to use the development branch? You will get the latest features, but things may break. (y/N)" -n 1 -r -s DEV && echo
-if [ "$DEV" != 'y'  ]; then
-  BRANCH="production"
+echo && read -p "Would you like to use the experimental branch? It contains the last major changes, such as the new browser and migrating to the docker (y/N)" -n 1 -r -s EXP && echo
+if [ "$EXP" != 'y'  ]; then
+  echo && read -p "Would you like to use the development branch? You will get the latest features, but things may break. (y/N)" -n 1 -r -s DEV && echo
+  if [ "$DEV" != 'y'  ]; then
+    export DOCKER_TAG="production"
+    BRANCH="production"
+  else
+    export DOCKER_TAG="latest"
+    BRANCH="master"
+  fi
 else
-  BRANCH="master"
+  export DOCKER_TAG="experimental"
+  BRANCH="experimental"
+fi
+
+echo && read -p "Do you want Screenly to manage your network? This is recommended for most users. (Y/n)" -n 1 -r -s NETWORK && echo
+if [ "$NETWORK" == 'n' ]; then
+  export MANAGE_NETWORK=false
+else
+  dpkg -s network-manager > /dev/null 2>&1
+  if [ "$?" = "1" ]; then
+    echo -e "\n\nIt looks like NetworkManager is not installed. Please install it by running 'sudo apt install -y network-manager' and then re-run the installation."
+    exit 1
+  fi
+  
+  export MANAGE_NETWORK=true
 fi
 
 echo && read -p "Would you like to perform a full system upgrade as well? (y/N)" -n 1 -r -s UPGRADE && echo
@@ -41,6 +62,14 @@ if [ "$UPGRADE" != 'y' ]; then
   EXTRA_ARGS="--skip-tags enable-ssl,system-upgrade"
 else
   EXTRA_ARGS="--skip-tags enable-ssl"
+fi
+
+if grep -qF "Raspberry Pi 3" /proc/device-tree/model; then
+   export DEVICE_TYPE="pi3"
+elif grep -qF "Raspberry Pi 2" /proc/device-tree/model; then
+   export DEVICE_TYPE="pi2"
+else
+   export DEVICE_TYPE="pi1"
 fi
 
 set -x
@@ -59,7 +88,8 @@ sudo apt-get update
 sudo apt-get purge -y python-setuptools python-pip python-pyasn1
 sudo apt-get install -y python-dev git-core libffi-dev libssl-dev
 curl -s https://bootstrap.pypa.io/get-pip.py | sudo python
-sudo pip install ansible==2.1.0.0
+
+sudo pip install ansible==2.6.3
 
 ansible localhost -m git -a "repo=${1:-https://github.com/screenly/screenly-ose.git} dest=/home/pi/screenly version=$BRANCH"
 cd /home/pi/screenly/ansible
@@ -78,3 +108,8 @@ cd ~/screenly && git rev-parse HEAD > ~/.screenly/latest_screenly_sha
 
 set +x
 echo "Installation completed."
+
+read -p "You need to reboot the system for the installation to complete. Would you like to reboot now? (y/N)" -n 1 -r -s REBOOT && echo
+if [ "$REBOOT" == 'y' ]; then
+  sudo reboot
+fi

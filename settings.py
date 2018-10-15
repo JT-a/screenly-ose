@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# -*- coding: utf8 -*-
+# -*- coding: utf-8 -*-
 
 from os import path, getenv
 from sys import exit
@@ -10,16 +10,18 @@ from UserDict import IterableUserDict
 from flask import request, Response
 from functools import wraps
 import zmq
+import hashlib
 
 CONFIG_DIR = '.screenly/'
 CONFIG_FILE = 'screenly.conf'
 DEFAULTS = {
     'main': {
         'database': CONFIG_DIR + 'screenly.db',
-        'listen': '0.0.0.0:8080',
         'assetdir': 'screenly_assets',
         'use_24_hour_clock': False,
-        'websocket_port': '9999'
+        'websocket_port': '9999',
+        'use_ssl': False,
+        'analytics_opt_out': False
     },
     'viewer': {
         'player_name': '',
@@ -30,15 +32,20 @@ DEFAULTS = {
         'default_duration': '10',
         'default_streaming_duration': '300',
         'debug_logging': False,
-        'verify_ssl': True,
+        'verify_ssl': True
     },
     'auth': {
         'user': '',
         'password': ''
     }
 }
-CONFIGURABLE_SETTINGS = DEFAULTS['viewer']
+CONFIGURABLE_SETTINGS = DEFAULTS['viewer'].copy()
+CONFIGURABLE_SETTINGS['user'] = DEFAULTS['auth']['user']
+CONFIGURABLE_SETTINGS['password'] = DEFAULTS['auth']['password']
 CONFIGURABLE_SETTINGS['use_24_hour_clock'] = DEFAULTS['main']['use_24_hour_clock']
+
+PORT = int(getenv('PORT', 8080))
+LISTEN = getenv('LISTEN', '127.0.0.1')
 
 # Initiate logging
 logging.basicConfig(level=logging.INFO,
@@ -62,8 +69,9 @@ class ScreenlySettings(IterableUserDict):
         self.conf_file = self.get_configfile()
 
         if not path.isfile(self.conf_file):
-            logging.error('Config-file %s missing', self.conf_file)
-            exit(1)
+            logging.error('Config-file %s missing. Using defaults.', self.conf_file)
+            self.use_defaults()
+            self.save()
         else:
             self.load()
 
@@ -75,6 +83,8 @@ class ScreenlySettings(IterableUserDict):
                 self[field] = config.getint(section, field)
             else:
                 self[field] = config.get(section, field)
+                if field == 'password' and self[field] != '' and len(self[field]) != 64:   # likely not a hashed password.
+                    self[field] = hashlib.sha256(self[field]).hexdigest()   # hash the original password.
         except ConfigParser.Error as e:
             logging.debug("Could not parse setting '%s.%s': %s. Using default value: '%s'." % (section, field, unicode(e), default))
             self[field] = default
@@ -96,12 +106,11 @@ class ScreenlySettings(IterableUserDict):
         for section, defaults in DEFAULTS.items():
             for field, default in defaults.items():
                 self._get(config, section, field, default)
-        try:
-            self.get_listen_ip()
-            int(self.get_listen_port())
-        except ValueError as e:
-            logging.info("Could not parse setting 'listen': %s. Using default value: '%s'." % (unicode(e), DEFAULTS['main']['listen']))
-            self['listen'] = DEFAULTS['main']['listen']
+
+    def use_defaults(self):
+        for defaults in DEFAULTS.items():
+            for field, default in defaults[1].items():
+                self[field] = default
 
     def save(self):
         # Write new settings to disk.
@@ -119,12 +128,6 @@ class ScreenlySettings(IterableUserDict):
 
     def get_configfile(self):
         return path.join(self.home, CONFIG_DIR, CONFIG_FILE)
-
-    def get_listen_ip(self):
-        return self['listen'].split(':')[0]
-
-    def get_listen_port(self):
-        return self['listen'].split(':')[1]
 
     def check_user(self, user, password):
         if not self['user'] or not self['password']:
@@ -145,8 +148,9 @@ class ZmqPublisher:
             raise ValueError("An instantiation already exists!")
 
         self.context = zmq.Context()
+
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.connect('tcp://127.0.0.1:10001')
+        self.socket.bind('tcp://127.0.0.1:10001')
         sleep(1)
 
     @classmethod
@@ -155,12 +159,16 @@ class ZmqPublisher:
             cls.INSTANCE = ZmqPublisher()
         return cls.INSTANCE
 
-    def send(self, msg):
-        self.socket.send(msg)
+    def send_to_ws_server(self, msg):
+        self.socket.send("ws_server {}".format(msg))
+
+    def send_to_viewer(self, msg):
+        self.socket.send_string("viewer {}".format(msg))
 
 
 def authenticate():
-    return Response("Access denied", 401, {"WWW-Authenticate": "Basic realm=private"})
+    realm = "Screenly OSE" + (" " + settings['player_name'] if settings['player_name'] else "")
+    return Response("Access denied", 401, {"WWW-Authenticate": 'Basic realm="' + realm + '"'})
 
 
 def auth_basic(orig):
@@ -169,7 +177,7 @@ def auth_basic(orig):
         if not settings['user'] or not settings['password']:
             return orig(*args, **kwargs)
         auth = request.authorization
-        if not auth or not settings.check_user(auth.username, auth.password):
+        if not auth or not settings.check_user(auth.username, hashlib.sha256(auth.password).hexdigest()):
             return authenticate()
         return orig(*args, **kwargs)
     return decorated
